@@ -50,7 +50,7 @@ from .transaction import (Transaction, multisig_script, TxOutput, PartialTransac
                           tx_from_any, PartialTxInput, TxOutpoint)
 from .invoices import PR_PAID, PR_UNPAID, PR_UNKNOWN, PR_EXPIRED
 from .synchronizer import Notifier
-from .wallet import Abstract_Wallet, create_new_wallet, restore_wallet_from_text, Deterministic_Wallet, BumpFeeStrategy
+from .wallet import Abstract_Wallet, Multisig_Wallet, create_new_wallet, restore_wallet_from_text, Deterministic_Wallet, BumpFeeStrategy
 from .address_synchronizer import TX_HEIGHT_LOCAL
 from .mnemonic import Mnemonic
 from .lnutil import SENT, RECEIVED
@@ -360,6 +360,10 @@ class Commands:
         return await self.network.listunspent_for_scripthash(sh)
 
     @command('')
+    async def parsetx(self, tx):
+        return tx_from_any(tx).to_json()
+
+    @command('')
     async def serialize(self, jsontx):
         """Create a transaction from json inputs.
         Inputs must have a redeemPubkey.
@@ -425,6 +429,62 @@ class Commands:
         """Sign a transaction. The wallet keys will be used to sign the transaction."""
         tx = tx_from_any(tx)
         wallet.sign_transaction(tx, password)
+        return tx.serialize()
+    
+    @command('wp')
+    async def signtransmulti(self, tx, c, i, wallet: Multisig_Wallet=None, password=None ):
+        """Sign a transaction. The wallet keys will be used to sign the transaction."""
+
+        tx = tx_from_any(tx)
+
+        from .keystore import Xpub
+        for ks in wallet.get_keystores():
+            if isinstance(ks, Xpub):
+                    fp_bytes, der_full = ks.get_fp_and_derivation_to_be_used_in_partial_tx(
+                        der_suffix=[], only_der_suffix=False)
+                    xpub = ks.get_xpub_to_be_used_in_partial_tx(only_der_suffix=False)
+                    bip32node = BIP32Node.from_xkey(xpub)
+                    tx.xpubs[bip32node] = (fp_bytes, der_full)
+        script_type = 'p2wsh-p2sh' if  c == 2 else 'p2sh'
+
+        pubkeys_k = {k.derive_pubkey(c, i): k for k in wallet.get_keystores()}
+        pubkeys = [pk for pk in list(pubkeys_k.keys())]
+
+        scriptcode = wallet.pubkeys_to_scriptcode(pubkeys)
+        redeem_script = scriptcode if script_type == 'p2sh' else bitcoin.p2wsh_nested_script(scriptcode)
+        this_address = bitcoin.redeem_script_to_address(script_type, scriptcode)
+        for txin in tx.inputs():
+            address = wallet.get_txin_address(txin)
+            wallet._add_input_utxo_info(txin, ignore_network_issues=True, address=address)
+            if this_address != address:
+                continue
+            txin.script_type = script_type
+            txin.num_sig = wallet.m
+
+            if txin.redeem_script is None:
+                redeem_script_hex = redeem_script
+                txin.redeem_script = bfh(redeem_script_hex) if redeem_script_hex else None
+            if txin.witness_script is None:
+                if txin.script_type == 'p2sh':
+                    witness_script_hex = None
+                else:
+                    witness_script_hex = scriptcode
+                    txin.witness_script = bfh(witness_script_hex) if witness_script_hex else None
+            txin.pubkeys = sorted(pubkeys)
+            txin.bip32_paths = {pk: ks.get_fp_and_derivation_to_be_used_in_partial_tx([c, i], only_der_suffix=False)  for (pk, ks) in pubkeys_k.items()}
+        for txout in tx.outputs():
+            wallet.add_output_info(
+                txout,
+                only_der_suffix=False,
+            )
+        from .util import UserCancelled
+        for k in sorted(wallet.get_keystores(), key=lambda ks: ks.ready_to_sign(), reverse=True):
+            try:
+                if k.can_sign(tx):
+                    k.sign_transaction(tx, password)
+            except UserCancelled:
+                continue
+        tx.remove_xpubs_and_bip32_paths()
         return tx.serialize()
 
     @command('')

@@ -526,15 +526,16 @@ class Xpub(MasterPublicKeyMixin):
     @lru_cache(maxsize=None)
     def derive_pubkey(self, for_change: int, n: int) -> bytes:
         for_change = int(for_change)
-        if for_change not in (0, 1):
-            raise CannotDerivePubkey("forbidden path")
-        xpub = self.xpub_change if for_change else self.xpub_receive
+        if for_change in (0, 1):
+            xpub = self.xpub_change if for_change else self.xpub_receive
+        else:
+            xpub = None
         if xpub is None:
             rootnode = self.get_bip32_node_for_xpub()
             xpub = rootnode.subkey_at_public_derivation((for_change,)).to_xpub()
-            if for_change:
+            if for_change == 1:
                 self.xpub_change = xpub
-            else:
+            elif for_change == 0:
                 self.xpub_receive = xpub
         return self.get_pubkey_from_xpub(xpub, (n,))
 
